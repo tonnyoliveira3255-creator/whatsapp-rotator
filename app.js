@@ -1,361 +1,403 @@
-// app.js — WhatsApp Rotator com pesos (%), ON/OFF, contadores e logs
+// app.js - WhatsApp Rotator com login via cookie e health-check automático
+// Node 18+ (Render está usando 22.x), sem dependências extras
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Auth simples (variáveis de ambiente)
+// --- Config -------------------------------------------------
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS || '123';
+const ADMIN_PASS = process.env.ADMIN_PASSWORD || '123';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || ''; // opcional
+const HEALTH_INTERVAL_SEC = parseInt(process.env.HEALTH_INTERVAL_SEC || '900', 10); // 15min
+const HEALTH_FAILS_TO_DISABLE = parseInt(process.env.HEALTH_FAILS_TO_DISABLE || '3', 10);
 
-// Arquivos
+// chave p/ assinar cookie (derivada da senha)
+const SESSION_SECRET = crypto.createHash('sha256').update(String(ADMIN_PASS)).digest();
+
+// --- Arquivos -----------------------------------------------
 const LINKS_FILE = path.join(__dirname, 'links.json');
-const STATS_FILE = path.join(__dirname, 'stats.json');        // { perNumber: {url: clicks}, perDay: {'YYYY-MM-DD': total}, total: n }
-const CLICKS_LOG = path.join(__dirname, 'clicks.ndjson');      // linhas {"ts":"...","url":"..."} por clique
+const CLICKS_NDJSON = path.join(__dirname, 'clicks.ndjson');
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-/* ------------------------ Utils de arquivo ------------------------ */
-function readJSON(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+// --- Util ----------------------------------------------------
+function readJSON(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
   catch { return fallback; }
 }
-function writeJSON(file, obj) {
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2), 'utf8');
+function writeJSON(p, obj) {
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
 }
 
-/* -------------------- Carregar / migrar links --------------------- */
-// Formatos aceitos:
-// 1) Antigo: ["https://wa.me/5599...", "..."]
-// 2) Novo:   [{ url, percent, enabled, clicks }]
-function loadLinksRaw() {
-  return readJSON(LINKS_FILE, []);
-}
-function normalizeLinks(arr) {
-  if (!Array.isArray(arr)) return [];
-  // Se vier strings, migra
-  if (arr.length && typeof arr[0] === 'string') {
-    const pct = Math.floor(100 / arr.length) || 100;
-    return arr.map(url => ({
-      url: ensureWaUrl(url),
-      percent: pct,
-      enabled: true,
-      clicks: 0
-    }));
-  }
-  // Garante campos e normaliza URL
-  let list = arr.map(item => ({
-    url: ensureWaUrl(item.url || ''),
-    percent: Number(item.percent) >= 0 ? Number(item.percent) : 0,
-    enabled: item.enabled !== false,
-    clicks: Number(item.clicks) || 0
+function ensureLinksShape(arr) {
+  // Cada item: { url, percent, active, clicks, fails }
+  return (arr || []).map(x => ({
+    url: String(x.url || ''),
+    percent: Number.isFinite(x.percent) ? Number(x.percent) : 50,
+    active: x.active !== false,
+    clicks: Number.isFinite(x.clicks) ? Number(x.clicks) : 0,
+    fails: Number.isFinite(x.fails) ? Number(x.fails) : 0,
   }));
-  // Se soma das % != 100, redistribui igualmente
-  const sum = list.reduce((a, b) => a + b.percent, 0);
-  if (sum !== 100) {
-    const eq = Math.floor(100 / (list.length || 1));
-    list = list.map(x => ({ ...x, percent: eq }));
-    // Ajusta resto na primeira posição para totalizar 100
-    const current = list.reduce((a, b) => a + b.percent, 0);
-    if (list.length && current !== 100) {
-      list[0].percent += (100 - current);
-    }
-  }
-  return list;
 }
+
 function loadLinks() {
-  const raw = loadLinksRaw();
-  const list = normalizeLinks(raw);
-  // salva migração se mudou
-  if (JSON.stringify(raw) !== JSON.stringify(list)) {
-    writeJSON(LINKS_FILE, list);
-  }
-  return list;
-}
-function saveLinks(list) {
-  writeJSON(LINKS_FILE, normalizeLinks(list));
+  return ensureLinksShape(readJSON(LINKS_FILE, []));
 }
 
-/* ------------------------ Stats e Logs ----------------------------- */
-function loadStats() {
-  const def = { perNumber: {}, perDay: {}, total: 0 };
-  return readJSON(STATS_FILE, def);
-}
-function saveStats(stats) { writeJSON(STATS_FILE, stats); }
-function todayKey() {
-  const d = new Date();
-  return d.toISOString().slice(0,10); // YYYY-MM-DD
-}
-function logClick(url) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), url }) + '\n';
-  fs.appendFile(CLICKS_LOG, line, () => {});
+function saveLinks(arr) {
+  writeJSON(LINKS_FILE, ensureLinksShape(arr));
 }
 
-/* ------------------------ Roteamento ------------------------------- */
-// Escolha ponderada por % entre enabled
-function pickWeighted(list) {
-  const enabled = list.filter(x => x.enabled && x.percent > 0);
-  if (!enabled.length) return null;
-  // Normaliza soma==100 (já garantimos), mas soma pode mudar ao filtrar OFF:
-  const sum = enabled.reduce((a,b)=>a+b.percent,0) || 1;
-  let r = Math.random() * sum;
-  for (const item of enabled) {
-    if ((r -= item.percent) <= 0) return item;
-  }
-  return enabled[enabled.length-1];
+function appendClickLog(row) {
+  fs.appendFileSync(CLICKS_NDJSON, JSON.stringify(row) + '\n');
 }
 
-// Health
-app.get('/health', (req, res) => res.send('ok'));
-
-// Página principal -> redireciona para um número/URL
-app.get('/', (req, res) => {
-  const list = loadLinks();
-  if (!list.length) return res.status(500).send('Nenhum número configurado');
-
-  const chosen = pickWeighted(list);
-  if (!chosen) return res.status(500).send('Nenhum número ativo');
-
-  // Contadores
-  chosen.clicks = (Number(chosen.clicks) || 0) + 1;
-  saveLinks(list);
-
-  const stats = loadStats();
-  stats.total = (stats.total || 0) + 1;
-  stats.perNumber[chosen.url] = (stats.perNumber[chosen.url] || 0) + 1;
-  const key = todayKey();
-  stats.perDay[key] = (stats.perDay[key] || 0) + 1;
-  saveStats(stats);
-
-  logClick(chosen.url);
-
-  return res.redirect(chosen.url);
-});
-
-// JSON cru dos links (para debug / import)
-app.get('/links', (req, res) => {
-  res.json(loadLinks());
-});
-
-// Stats públicas
-app.get('/stats', (req, res) => {
-  const stats = loadStats();
-  const list = loadLinks();
-  // anexa info enabled/percent na resposta
-  const perNumber = {};
-  for (const l of list) {
-    perNumber[l.url] = {
-      clicks: stats.perNumber[l.url] || 0,
-      percent: l.percent,
-      enabled: !!l.enabled
-    };
-  }
-  res.json({
-    total: stats.total || 0,
-    perDay: stats.perDay || {},
-    perNumber
-  });
-});
-
-/* ------------------------ Admin (com auth) ------------------------- */
-function auth(req, res, next) {
-  const u = String(req.headers['x-admin-user'] || req.query.user || req.body.user || '');
-  const p = String(req.headers['x-admin-pass'] || req.query.pass || req.body.pass || '');
-  if (u === ADMIN_USER && p === ADMIN_PASS) return next();
-  res.status(401).send(`
-    <html><body style="font-family:ui-sans-serif, system-ui">
-    <h3>Login admin</h3>
-    <form method="GET">
-      <input name="user" placeholder="user" />
-      <input name="pass" placeholder="pass" type="password" />
-      <button>Entrar</button>
-    </form>
-    </body></html>
-  `);
+// Salva com segurança crua (já validada antes)
+function saveRawLinks(arr) {
+  fs.writeFileSync(LINKS_FILE, JSON.stringify(arr, null, 2));
 }
 
-// UI Admin bonitinha
-app.get('/admin', auth, (req, res) => {
-  const list = loadLinks();
-  const stats = loadStats();
-  const totalLinks = list.length;
-  const totalEnabled = list.filter(x=>x.enabled).length;
-  const lastAt = new Date().toLocaleString('pt-BR');
+// --- Cookie mini-sessão -------------------------------------
+function sign(data) {
+  const h = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  return `${data}.${h}`;
+}
+function verify(signed) {
+  const i = signed.lastIndexOf('.');
+  if (i < 0) return null;
+  const data = signed.slice(0, i);
+  const h = signed.slice(i + 1);
+  const good = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  if (crypto.timingSafeEqual(Buffer.from(h), Buffer.from(good))) return data;
+  return null;
+}
+function setSessionCookie(res, user) {
+  const payload = `${user}|${Date.now()}`; // simples
+  const value = sign(payload);
+  res.setHeader('Set-Cookie', [
+    `adm=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 3600}`
+  ]);
+}
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', 'adm=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+}
+function getCookie(req, name) {
+  const h = req.headers.cookie || '';
+  const m = h.match(new RegExp('(?:^|; )' + name + '=([^;]+)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+function isAuthed(req) {
+  const c = getCookie(req, 'adm');
+  if (!c) return false;
+  const data = verify(c);
+  if (!data) return false;
+  const [user, ts] = data.split('|');
+  if (user !== ADMIN_USER) return false;
+  // sessão válida por 7 dias
+  if (Date.now() - Number(ts) > 7 * 24 * 3600 * 1000) return false;
+  return true;
+}
 
-  res.send(`<!doctype html>
-<html lang="pt-br"><head>
+// --- HTML: Login (responsivo / mobile friendly) --------------
+function renderLogin(res, msg = "") {
+  res.type("html").send(`<!doctype html>
+<html lang="pt-br">
+<head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Login admin</title>
+<style>
+:root{color-scheme:dark light}
+*{box-sizing:border-box}
+body{
+  margin:0; min-height:100svh; display:grid; place-items:center;
+  background:#0b0f13; color:#e7eef6;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;
+  padding:clamp(16px,2.5vw,24px);
+  padding-left:calc(env(safe-area-inset-left) + 16px);
+  padding-right:calc(env(safe-area-inset-right) + 16px);
+}
+.card{
+  width:min(440px,100%); background:#10151b; border:1px solid #1d2632;
+  border-radius:16px; padding:20px; box-shadow:0 12px 40px rgba(0,0,0,.25);
+}
+h1{margin:0 0 4px; font-size:22px}
+.sub{opacity:.75; font-size:14px; margin-bottom:20px}
+.msg{display:${msg ? "block" : "none"}; background:#1b2735; color:#ffd6d6;
+  border:1px solid #3b2020; border-radius:12px; padding:10px 12px; font-size:14px; margin-bottom:12px}
+label{display:block; font-size:14px; margin:10px 0 6px; color:#a9bccf}
+.field{position:relative; background:#0e1319; border:1px solid #223044;
+  border-radius:12px; padding:0 12px; display:flex; align-items:center}
+input{
+  appearance:none; border:0; background:transparent; color:#e7eef6;
+  width:100%; height:48px; font-size:16px; outline:none;
+}
+.toggle{background:none; border:0; color:#9fb2c8; cursor:pointer; font-size:13px; padding:6px 8px; border-radius:8px}
+.toggle:active{transform:scale(.98)}
+.row{display:grid; gap:12px}
+.actions{margin-top:16px; display:flex; gap:12px}
+.btn{appearance:none; border:0; border-radius:12px; height:48px; padding:0 16px; font-size:16px; cursor:pointer}
+.btn.primary{background:#2b87ff; color:#fff; flex:1}
+.btn.secondary{background:#18202b; color:#cfe6ff}
+.meta{margin-top:10px; font-size:12px; opacity:.6; text-align:center}
+@media (max-width:420px){.actions{flex-direction:column}.btn{width:100%}}
+</style>
+</head>
+<body>
+  <main class="card" role="dialog" aria-label="Login administrador">
+    <h1>Entrar</h1>
+    <div class="sub">Acesse o painel do rotador</div>
+    <div class="msg" role="alert">${msg ? String(msg).replace(/</g,"&lt;") : ""}</div>
+    <form class="row" method="POST" action="/login" autocomplete="on" novalidate>
+      <div>
+        <label for="user">Usuário</label>
+        <div class="field"><input id="user" name="user" inputmode="text" autocomplete="username" placeholder="admin" required/></div>
+      </div>
+      <div>
+        <label for="pass">Senha</label>
+        <div class="field">
+          <input id="pass" name="pass" type="password" autocomplete="current-password" placeholder="••••••••" required/>
+          <button class="toggle" type="button" aria-label="mostrar senha" onclick="
+            const p=document.getElementById('pass');
+            p.type = p.type==='password' ? 'text' : 'password';
+            this.textContent = p.type==='password' ? 'mostrar' : 'ocultar';
+          ">mostrar</button>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn secondary" type="reset">Limpar</button>
+        <button class="btn primary" type="submit">Entrar</button>
+      </div>
+      <div class="meta">Dica: defina <code>ADMIN_USER</code> e <code>ADMIN_PASSWORD</code> nas variáveis de ambiente.</div>
+    </form>
+  </main>
+  <script>setTimeout(()=>document.getElementById('user')?.focus(),50)</script>
+</body>
+</html>`);
+}
+
+// --- Helpers de URL -----------------------------------------
+function ensureWaUrl(v) {
+  v = String(v || '').trim();
+  if (!v) return '';
+  // mantém URLs já completas (http/https)
+  const httpRe = /^https?:\/\/.*/i;
+  if (httpRe.test(v)) return v;
+  // só dígitos => wa.me/NUM
+  if (/^\d+$/.test(v)) return 'https://wa.me/' + v;
+  // fallback (deixa como está)
+  return v;
+}
+
+// Escolha ponderada por percent (apenas links ativos)
+function pickWeighted(list) {
+  const arr = list.filter(x => x.active && x.percent > 0);
+  const sum = arr.reduce((s, it) => s + it.percent, 0);
+  if (!arr.length || sum <= 0) return null;
+  const r = Math.random() * sum;
+  let acc = 0;
+  for (const it of arr) {
+    acc += it.percent;
+    if (r <= acc) return it;
+  }
+  return arr[arr.length - 1];
+}
+
+// --- Middleware / Parsers -----------------------------------
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// --- Auth: rotas /login e proteção /admin -------------------
+app.post('/login', (req, res) => {
+  const { user, pass } = req.body || {};
+  if (String(user) === ADMIN_USER && String(pass) === ADMIN_PASS) {
+    setSessionCookie(res, ADMIN_USER);
+    return res.redirect('/admin');
+  }
+  return renderLogin(res, 'Usuário ou senha inválidos.');
+});
+
+app.post('/logout', (req, res) => {
+  clearSessionCookie(res);
+  res.redirect('/admin');
+});
+
+function requireAuth(req, res, next) {
+  if (isAuthed(req)) return next();
+  return renderLogin(res);
+}
+
+// --- Painel Admin -------------------------------------------
+app.get('/admin', requireAuth, (req, res) => {
+  const links = loadLinks();
+  const total = links.reduce((s, x) => s + (x.percent || 0), 0);
+  const activeCount = links.filter(x => x.active).length;
+  const last = new Date().toLocaleString('pt-BR');
+
+  // painel (o seu visual já melhorado anteriormente)
+  res.type('html').send(`<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>Rotador WhatsApp — Admin</title>
 <style>
-  :root {
-    color-scheme: dark;
-  }
-  body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial; background:#0b0f15; color:#e6edf3; margin:0; padding:32px;}
-  .wrap{max-width:980px; margin:0 auto;}
-  h1{font-size:22px; margin:0 0 8px}
-  .muted{color:#8b949e; font-size:13px}
-  .card{background:#111827; border:1px solid #243041; border-radius:12px; padding:16px; margin-top:16px}
-  .row{display:grid; grid-template-columns: 1fr 120px 100px 110px; gap:10px; align-items:center}
-  .row.header{font-size:12px; color:#9aa3ad; text-transform:uppercase; letter-spacing:.06em}
-  input[type="text"], input[type="number"]{
-    width:100%; padding:10px 12px; background:#0f172a; border:1px solid #233049; color:#e6edf3; border-radius:10px;
-  }
-  input[type="number"]{ text-align:right }
-  .toggle{display:flex; align-items:center; gap:8px}
-  .btn{padding:10px 14px; background:#2563eb; color:#fff; border:none; border-radius:10px; cursor:pointer}
-  .btn.secondary{background:#374151}
-  .btn.danger{background:#dc2626}
-  .toolbar{display:flex; gap:8px; margin-top:12px}
-  .right{justify-content:flex-end}
-  .table{display:flex; flex-direction:column; gap:8px; margin-top:10px; max-height:58vh; overflow:auto}
-  .pill{font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid #233049; background:#0f172a; color:#c9d1d9}
-  .grid{display:grid; grid-template-columns: repeat(3,1fr); gap:10px}
-  a{color:#60a5fa}
+:root{color-scheme:dark light}
+*{box-sizing:border-box}
+body{margin:0;background:#0b0f13;color:#e7eef6;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
+.wrap{max-width:980px;margin:auto;padding:16px}
+h1{margin:8px 0 16px;font-size:20px}
+.card{background:#10151b;border:1px solid #1d2632;border-radius:14px;padding:16px;margin-bottom:16px}
+.row{display:grid;grid-template-columns:1fr 100px 80px 100px;gap:10px;align-items:center}
+.row input, .row select{height:40px;border-radius:10px;border:1px solid #223044;background:#0e1319;color:#e7eef6;padding:0 10px;font-size:14px}
+.btn{height:40px;border-radius:10px;border:0;cursor:pointer;font-size:14px}
+.btn.blue{background:#2b87ff;color:#fff}
+.btn.red{background:#372127;color:#ffd6d6}
+.btn.gray{background:#18202b;color:#cfe6ff}
+.small{font-size:12px;opacity:.7}
+.flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.badge{padding:2px 8px;border-radius:999px;background:#19212c;border:1px solid #263142;font-size:12px}
+.table{display:grid;gap:10px}
+.header{opacity:.7;font-size:12px;display:grid;grid-template-columns:1fr 100px 80px 100px;padding:0 6px}
+footer{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:10px}
+@media (max-width:720px){
+  .row,.header{grid-template-columns:1fr 1fr}
+}
 </style>
-</head><body><div class="wrap">
+</head>
+<body>
+<div class="wrap">
   <h1>Rotador WhatsApp — Admin</h1>
-  <div class="muted">Usuário: <b>${ADMIN_USER}</b> · Links: ${totalLinks} (${totalEnabled} ativos) · Última visualização: ${lastAt}</div>
+  <div class="small">Usuário: <b>admin</b> · Links: ${links.length} (${activeCount} ativos) · Última visualização: ${last}</div>
 
   <div class="card">
-    <div class="toolbar">
-      <button class="btn" onclick="addRow()">+ Adicionar linha</button>
-      <button class="btn secondary" onclick="formatDigits()">Formatar (só dígitos)</button>
-      <button class="btn secondary" onclick="removeDups()">Remover duplicatas</button>
-      <button class="btn secondary" onclick="redistribute()">Redistribuir %</button>
-      <div class="right" style="flex:1"></div>
-      <a href="/links" class="pill" target="_blank">Ver JSON /links</a>
-      <a href="/stats" class="pill" target="_blank">Ver /stats</a>
+    <div class="flex" style="justify-content:space-between;margin-bottom:10px">
+      <div class="flex">
+        <button class="btn gray" onclick="addRow()">+ Adicionar linha</button>
+        <button class="btn gray" onclick="formatDigits()">Formatar (só dígitos)</button>
+        <button class="btn gray" onclick="dedup()">Remover duplicatas</button>
+        <button class="btn gray" onclick="rebal()">Redistribuir %</button>
+        <button class="btn gray" onclick="testLinks()">Testar links</button>
+      </div>
+      <div class="flex">
+        <a class="badge" href="/links" target="_blank">Ver JSON /links</a>
+        <a class="badge" href="/stats" target="_blank">Ver /stats</a>
+      </div>
     </div>
 
-    <div class="row header" style="margin-top:10px">
-      <div>Número / URL</div><div>%</div><div>Ativo</div><div>Cliques</div>
-    </div>
+    <div class="header"><div>NÚMERO / URL</div><div>%</div><div>ATIVO</div><div>CLICKS</div></div>
     <div id="table" class="table"></div>
 
-    <div class="toolbar" style="margin-top:14px">
-      <div class="muted" id="sumPct"></div>
-      <div class="right" style="flex:1"></div>
-      <button class="btn" onclick="saveAll()">Salvar</button>
-    </div>
+    <div class="small" style="margin-top:6px">Soma das %: <b id="sum">${total}</b> (deve dar 100)</div>
+
+    <footer>
+      <form method="POST" action="/logout"><button class="btn red">Sair</button></form>
+      <button class="btn blue" onclick="save()">Salvar</button>
+    </footer>
   </div>
 
-  <div class="card">
-    <div class="grid">
-      <div><div class="muted">Total de cliques</div><div style="font-size:20px; margin-top:4px">${(stats.total||0).toLocaleString('pt-BR')}</div></div>
-      <div><div class="muted">Hoje</div><div style="font-size:20px; margin-top:4px">${(stats.perDay && stats.perDay['${todayKey()}'] || 0).toLocaleString('pt-BR')}</div></div>
-      <div><div class="muted">Logs</div><div style="font-size:14px; margin-top:6px"><span class="pill">clicks.ndjson</span> gravando 1 linha por clique</div></div>
-    </div>
+  <div class="card small">
+    <div>Logs: <code>clicks.ndjson</code> · Clique gera 1 linha. Falhas consecutivas desativam link após <b>${HEALTH_FAILS_TO_DISABLE}</b> erros.</div>
   </div>
-
 </div>
+
 <script>
-  const ADMIN_USER = ${JSON.stringify(ADMIN_USER)};
-  const ADMIN_PASS = ${JSON.stringify(ADMIN_PASS)};
-  let data = ${JSON.stringify(loadLinks())};
+const init = ${JSON.stringify(links)};
 
-  function ensureWaUrl(v){
-    v = (v||'').trim();
-    if (!v) return '';
-    // se for só dígitos, vira https://wa.me/NUM
-    if (/^\\d+$/.test(v)) return 'https://wa.me/' + v;
-    // se já é wa.me ou api.whatsapp, mantém
-    return v;
-  }
+function rowTpl(i, it){
+  return \`
+    <div class="row">
+      <input data-k="url" value="\${it.url}" placeholder="https://wa.me/5599... ou URL completa"/>
+      <input data-k="percent" type="number" min="0" max="100" value="\${it.percent}"/>
+      <select data-k="active">
+        <option value="true"\${it.active?' selected':''}>on</option>
+        <option value="false"\${!it.active?' selected':''}>off</option>
+      </select>
+      <div class="small">\${it.clicks||0}</div>
+    </div>\`;
+}
 
-  function render() {
-    const box = document.getElementById('table');
-    box.innerHTML = '';
-    let sum = 0;
-    data.forEach((row, i) => {
-      sum += Number(row.percent)||0;
-      const wrap = document.createElement('div');
-      wrap.className = 'row';
-      wrap.innerHTML = \`
-        <input type="text" value="\${row.url||''}" oninput="onUrl(\${i}, this.value)" />
-        <input type="number" min="0" max="100" value="\${row.percent||0}" oninput="onPercent(\${i}, this.value)" />
-        <div class="toggle">
-          <input type="checkbox" \${row.enabled ? 'checked':''} onchange="onEnabled(\${i}, this.checked)" />
-          <button class="btn danger" style="padding:6px 10px" onclick="delRow(\${i})">remover</button>
-        </div>
-        <div>\${row.clicks||0}</div>
-      \`;
-      box.appendChild(wrap);
+function render(list){ table.innerHTML = list.map(rowTpl).join(''); updateSum(); }
+function collect(){
+  return Array.from(document.querySelectorAll('#table .row')).map(r=>{
+    const o = {};
+    r.querySelectorAll('[data-k]').forEach(inp=>{
+      const k = inp.getAttribute('data-k');
+      let v = inp.value;
+      if (k==='percent') v = Number(v||0);
+      if (k==='active') v = (v==='true');
+      o[k]=v;
     });
-    document.getElementById('sumPct').textContent = 'Soma das %: ' + sum + ' (deve dar 100)';
+    return o;
+  });
+}
+function updateSum(){
+  const s = collect().reduce((a,b)=>a + Number(b.percent||0), 0);
+  sum.textContent = s;
+}
+function addRow(){
+  table.insertAdjacentHTML('beforeend', rowTpl(0, {url:'',percent:50,active:true,clicks:0}));
+}
+function formatDigits(){
+  document.querySelectorAll('input[data-k="url"]').forEach(inp=>{
+    const only = inp.value.replace(/\\D+/g,'');
+    if (only) inp.value = 'https://wa.me/' + only;
+  });
+}
+function dedup(){
+  const arr = collect();
+  const seen = new Set();
+  const out = [];
+  for (const it of arr) {
+    const k = it.url.trim().toLowerCase();
+    if (!seen.has(k)) { seen.add(k); out.push(it); }
   }
+  render(out);
+}
+function rebal(){
+  const arr = collect();
+  const n = arr.length || 1;
+  const eq = Math.floor(100 / n);
+  let sum = eq*n;
+  for (let i=0;i<n;i++) arr[i].percent = eq;
+  arr[0].percent += (100 - sum);
+  render(arr);
+}
+async function save(){
+  const data = collect();
+  const r = await fetch('/admin/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+  const j = await r.json();
+  alert(j.ok ? 'Salvo com sucesso!' : ('ERRO: ' + (j.error||'desconhecido')));
+}
+async function testLinks(){
+  const r = await fetch('/admin/test', {method:'POST'});
+  const j = await r.json();
+  alert('OK: '+j.ok+' | testados: '+j.tested+' | desativados: '+(j.autoDisabled||0));
+}
+render(init);
 
-  function onUrl(i, v){ data[i].url = ensureWaUrl(v); }
-  function onPercent(i, v){ data[i].percent = Math.max(0, Math.min(100, Number(v)||0)); }
-  function onEnabled(i, v){ data[i].enabled = !!v; }
-
-  function addRow(){
-    data.push({ url:'https://wa.me/5585XXXXXXXX', percent:0, enabled:true, clicks:0 });
-    render();
-  }
-  function delRow(i){
-    data.splice(i,1); render();
-  }
-  function removeDups(){
-    const seen = new Set();
-    data = data.filter(x => {
-      const k = (x.url||'').trim();
-      if (!k || seen.has(k)) return false;
-      seen.add(k); return true;
-    });
-    render();
-  }
-  function formatDigits(){
-    data = data.map(x => ({...x, url: ensureWaUrl((x.url||'').replace(/\\D/g,''))}));
-    render();
-  }
-  function redistribute(){
-    const n = data.length || 1;
-    const eq = Math.floor(100 / n);
-    data = data.map(x => ({...x, percent: eq}));
-    const sum = data.reduce((a,b)=>a+b.percent,0);
-    if (sum !== 100 && data.length) data[0].percent += (100 - sum);
-    render();
-  }
-
-  async function saveAll(){
-    // limpeza básica
-    data = data.filter(x => (x.url||'').trim());
-    // soma % deve dar 100 (o backend ainda normaliza)
-    try{
-      const r = await fetch('/admin/save', {
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-admin-user':ADMIN_USER,'x-admin-pass':ADMIN_PASS},
-        body: JSON.stringify({ items: data })
-      });
-      const j = await r.json();
-      alert(j.ok ? ('Salvo! Itens: '+j.count) : ('Erro: '+(j.error||'desconhecido')));
-      if (j.ok) location.reload();
-    }catch(e){ alert('Falha ao salvar: '+e.message) }
-  }
-
-  render();
+table.addEventListener('input', e=>{ if(e.target.matches('[data-k="percent"]')) updateSum(); });
 </script>
-</body></html>`);
+</body>
+</html>`);
 });
 
-// Salvar (JSON com items[])
-app.post('/admin/save', auth, (req, res) => {
+// salvar alterações
+app.post('/admin/save', requireAuth, (req, res) => {
   try {
-    const items = Array.isArray(req.body.items) ? req.body.items : [];
-    const cleaned = items
-      .map(x => ({
-        url: ensureWaUrl(x.url || ''),
-        percent: Number(x.percent) || 0,
-        enabled: x.enabled !== false,
-        clicks: Number(x.clicks) || 0
-      }))
-      .filter(x => x.url);
+    const arr = Array.isArray(req.body) ? req.body : [];
+    const cleaned = arr.map(it => ({
+      url: ensureWaUrl(it.url),
+      percent: Math.max(0, Math.min(100, Number(it.percent||0))),
+      active: !!it.active,
+      clicks: Number(it.clicks||0),
+      fails: Number(it.fails||0),
+    })).filter(x => x.url);
 
-    // Normaliza soma de % para 100
+    // normaliza soma de % para 100
     let sum = cleaned.reduce((a,b)=>a+b.percent,0);
     if (sum !== 100 && cleaned.length) {
       const eq = Math.floor(100 / cleaned.length);
@@ -363,7 +405,6 @@ app.post('/admin/save', auth, (req, res) => {
       const now = cleaned.reduce((a,b)=>a+b.percent,0);
       if (now !== 100) cleaned[0].percent += (100 - now);
     }
-
     saveLinks(cleaned);
     return res.json({ ok:true, count: cleaned.length });
   } catch (err) {
@@ -371,22 +412,110 @@ app.post('/admin/save', auth, (req, res) => {
   }
 });
 
-/* ----------------------- Helpers servidor ------------------------ */
-function ensureWaUrl(v) {
-  v = String(v || '').trim();
-  if (!v) return '';
+// testar agora (ping) — desativa ao exceder limite de falhas
+app.post('/admin/test', requireAuth, async (req, res) => {
+  const { tested, autoDisabled } = await healthCheckAll();
+  res.json({ ok:true, tested, autoDisabled });
+});
 
-  // mantém URLs completas (http ou https)
-  const httpRe = /^https?:\/\/.*/;
-  if (httpRe.test(v)) return v;
+// JSON público
+app.get('/links', (req, res) => {
+  res.json(loadLinks());
+});
+app.get('/stats', (req, res) => {
+  // resumo simples do NDJSON (total de linhas)
+  let total = 0, today = 0;
+  try {
+    const lines = fs.readFileSync(CLICKS_NDJSON, 'utf8').trim().split('\n').filter(Boolean);
+    total = lines.length;
+    const d = new Date().toISOString().slice(0,10);
+    today = lines.filter(l => l.includes(`"day":"${d}"`)).length;
+  } catch {}
+  res.json({ total, today });
+});
 
-  // só dígitos => vira wa.me/NUMERO
-  if (/^\d+$/.test(v)) return 'https://wa.me/' + v;
+// Health simples da app
+app.get('/health', (req, res) => res.send('ok'));
 
-  return v; // fallback (deixa como está)
+// Rotador
+app.get('/', async (req, res) => {
+  const links = loadLinks();
+  const chosen = pickWeighted(links);
+  if (!chosen) return res.status(500).send('Nenhum número configurado.');
+
+  // registra clique
+  chosen.clicks = (chosen.clicks || 0) + 1;
+  saveLinks(links);
+
+  const now = new Date();
+  appendClickLog({
+    ts: now.toISOString(),
+    day: now.toISOString().slice(0,10),
+    url: chosen.url, ua: req.headers['user-agent']||'',
+    ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress || ''
+  });
+
+  // redireciona
+  res.redirect(chosen.url);
+});
+
+// --- Health check / auto disable -----------------------------
+// Regra: para cada link ativo, faz um fetch HEAD/GET; se erro de rede
+// ou status >= 400 por N vezes seguidas, desativa e dispara webhook.
+
+async function checkOneLink(it) {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(()=>controller.abort(), 8000);
+    const resp = await fetch(it.url, { method:'GET', redirect:'follow', signal: controller.signal });
+    clearTimeout(t);
+    // Considera saudável status 2xx ou 3xx
+    return resp.status < 400;
+  } catch {
+    return false;
+  }
 }
 
-/* ----------------------------- START ------------------------------ */
-app.listen(PORT, () => {
-  console.log(`WhatsApp rotator rodando na porta ${PORT}`);
-});
+async function healthCheckAll() {
+  let links = loadLinks();
+  let tested = 0, autoDisabled = 0;
+
+  for (const it of links) {
+    if (!it.active) continue;
+    tested++;
+    const ok = await checkOneLink(it);
+    if (ok) {
+      it.fails = 0;
+    } else {
+      it.fails = (it.fails || 0) + 1;
+      if (it.fails >= HEALTH_FAILS_TO_DISABLE) {
+        it.active = false;
+        autoDisabled++;
+        notifyWebhook({
+          type: 'link_auto_disabled',
+          url: it.url,
+          reason: `Falhou ${it.fails}x seguidas`,
+          at: new Date().toISOString()
+        });
+      }
+    }
+  }
+  saveLinks(links);
+  return { tested, autoDisabled };
+}
+
+function notifyWebhook(payload) {
+  if (!WEBHOOK_URL) return;
+  fetch(WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify(payload)
+  }).catch(()=>{});
+}
+
+// Agenda verificação periódica
+setInterval(healthCheckAll, HEALTH_INTERVAL_SEC * 1000);
+
+// --- Start ---------------------------------------------------
+app.listen(PORT, () => console.log(`WhatsApp rotator rodando na porta ${PORT}`));
+
