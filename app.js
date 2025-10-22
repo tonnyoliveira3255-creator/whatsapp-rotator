@@ -371,14 +371,19 @@ app.post('/admin/save', auth, (req, res) => {
   }
 });
 
-/* ------------------------ Helpers servidor ------------------------ */
+/* ----------------------- Helpers servidor ------------------------ */
 function ensureWaUrl(v) {
-  v = String(v||'').trim();
+  v = String(v || '').trim();
   if (!v) return '';
-  if (/^https?:\\/\\//i.test(v)) return v;
-  // só dígitos => wa.me/NUM
-  if (/^\\d+$/.test(v)) return 'https://wa.me/' + v;
-  return v; // fallback
+
+  // mantém URLs completas (http ou https)
+  const httpRe = /^https?:\/\/.*/;
+  if (httpRe.test(v)) return v;
+
+  // só dígitos => vira wa.me/NUMERO
+  if (/^\d+$/.test(v)) return 'https://wa.me/' + v;
+
+  return v; // fallback (deixa como está)
 }
 
 /* ----------------------------- START ------------------------------ */
