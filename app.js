@@ -1,7 +1,7 @@
 // app.js
-import express from "express";
-import cookieParser from "cookie-parser";
-import { Pool } from "pg";
+const express = require("express");
+const cookieParser = require("cookie-parser");
+const { Pool } = require("pg");
 
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
