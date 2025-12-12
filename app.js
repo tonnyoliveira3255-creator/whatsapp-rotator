@@ -11,7 +11,7 @@ const { Pool } = require("pg");
 const app = express();
 const port = process.env.PORT || 10000;
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "troque-isto";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123@";
 const BASE_WA = "https://wa.me/"; // link fixo (sem mensagem)
 
 // --- Postgres ---
